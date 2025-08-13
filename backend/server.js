@@ -9,6 +9,7 @@ const QRCode = require("qrcode");
 const mime = require("mime-types");
 const { Client, LocalAuth, MessageMedia } = require("whatsapp-web.js");
 
+require('dotenv').config();
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server, {
@@ -18,7 +19,11 @@ const io = new Server(server, {
   }
 });
 
-app.use(cors({ origin: "http://localhost:3000" })); // adjust for prod
+app.use(cors({
+  origin: process.env.FRONTEND_URL,
+  methods: ["GET", "POST"],
+  credentials: true
+ }));
 app.use(express.json());
 
 // temp upload dir (auto-cleaned after send)

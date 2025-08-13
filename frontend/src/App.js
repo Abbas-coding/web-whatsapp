@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState } from "react";
 import { io } from "socket.io-client";
 
-const API = "http://localhost:5000"; // change for prod
+const API = process.env.REACT_APP_BACKEND_URL; // change for prod
 
 function App() {
   const [sessionId, setSessionId] = useState("");
