@@ -1,3 +1,6 @@
+// server.js
+require("dotenv").config();
+
 const express = require("express");
 const http = require("http");
 const { Server } = require("socket.io");
@@ -9,31 +12,57 @@ const QRCode = require("qrcode");
 const mime = require("mime-types");
 const { Client, LocalAuth, MessageMedia } = require("whatsapp-web.js");
 
-require('dotenv').config();
 const app = express();
 const server = http.createServer(app);
-const io = new Server(server, {
-  cors: {
-    origin: [process.env.FRONTEND_URL], // change for prod
-    methods: ["GET", "POST"]
-  }
-});
 
-app.use(cors({
-  origin: process.env.FRONTEND_URL,
-  methods: ["GET", "POST"],
-  credentials: true
- }));
+// ===== CORS (REST) =====
+const ALLOWED_ORIGINS = [
+  process.env.FRONTEND_URL,           // production frontend
+  "http://localhost:3000"             // local dev frontend
+].filter(Boolean);
+
+app.use((req, res, next) => {
+  // make sure preflights never fail
+  res.header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  res.header("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  if (ALLOWED_ORIGINS.includes(req.headers.origin)) {
+    res.header("Access-Control-Allow-Origin", req.headers.origin);
+  }
+  if (req.method === "OPTIONS") return res.sendStatus(200);
+  next();
+});
+app.use(cors({ origin: ALLOWED_ORIGINS, methods: ["GET", "POST"], credentials: false }));
 app.use(express.json());
 
-// temp upload dir (auto-cleaned after send)
-const upload = multer({ dest: path.join(__dirname, "uploads") });
+// ===== Socket.IO (CORS) =====
+const io = new Server(server, {
+  cors: { origin: ALLOWED_ORIGINS, methods: ["GET", "POST"] }
+});
 
-// ===== Session store =====
+// ===== Uploads (fixed paths) =====
+const UPLOAD_DIR = path.join(__dirname, "uploads");
+const SENT_DIR = path.join(__dirname, "sent_files");
+if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR);
+if (!fs.existsSync(SENT_DIR)) fs.mkdirSync(SENT_DIR);
+const upload = multer({ dest: UPLOAD_DIR });
+
+// ===== Logs (ring buffer) =====
+const MAX_LOGS = 1000;
+const logs = []; // {ts, sessionId, level, msg, meta}
+
+const log = (level, msg, sessionId = null, meta = null) => {
+  const entry = { ts: new Date().toISOString(), sessionId, level, msg, meta };
+  logs.push(entry);
+  if (logs.length > MAX_LOGS) logs.shift();
+  console.log(`[${entry.ts}] [${level}] ${sessionId ? `[${sessionId}] ` : ""}${msg}`, meta || "");
+};
+const emitTo = (sessionId, event, payload) => io.to(sessionId).emit(event, payload);
+
+// ===== Sessions =====
 /**
  * sessions = {
  *   [sessionId]: {
- *     client: WhatsAppClient,
+ *     client,
  *     ready: boolean,
  *     qrDataUrl: string | null
  *   }
@@ -41,32 +70,45 @@ const upload = multer({ dest: path.join(__dirname, "uploads") });
  */
 const sessions = {};
 
-// ===== Helpers =====
+const getAuthDirsForSession = (sessionId) => {
+  // whatsapp-web.js with LocalAuth stores at .wwebjs_auth/session-<clientId>
+  const base = path.join(process.cwd(), ".wwebjs_auth");
+  return [
+    path.join(base, `session-${sessionId}`),
+    // fallback pattern (older versions)
+    path.join(base, sessionId)
+  ];
+};
+
 const ensureConnected = async (sessionId) => {
-  const session = sessions[sessionId];
-  if (!session || !session.client) return { ok: false, reason: "NO_SESSION" };
+  const sess = sessions[sessionId];
+  if (!sess || !sess.client) return { ok: false, reason: "NO_SESSION" };
   try {
-    const state = await session.client.getState();
+    const state = await sess.client.getState();
     const connected = state === "CONNECTED";
-    session.ready = connected;
+    sess.ready = connected;
     return { ok: connected, reason: connected ? null : "NOT_CONNECTED" };
-  } catch {
-    session.ready = false;
+  } catch (e) {
+    sess.ready = false;
     return { ok: false, reason: "NOT_CONNECTED" };
   }
 };
 
-const emitTo = (sessionId, event, payload) => {
-  io.to(sessionId).emit(event, payload);
-};
-
-// ===== Create/Init Session =====
 const createSession = (sessionId) => {
   const client = new Client({
     authStrategy: new LocalAuth({ clientId: sessionId }),
     puppeteer: {
       headless: true,
-      args: ["--no-sandbox", "--disable-setuid-sandbox"]
+      // Render-friendly flags for quick, sandboxed startup
+      args: [
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-gpu",
+        "--disable-extensions",
+        "--disable-dev-shm-usage",
+        "--no-zygote",
+        "--single-process"
+      ]
     }
   });
 
@@ -78,62 +120,73 @@ const createSession = (sessionId) => {
       sessions[sessionId].qrDataUrl = dataUrl;
       emitTo(sessionId, "qr", { qr: dataUrl });
       emitTo(sessionId, "status", { status: "WAITING_QR" });
+      log("INFO", "QR generated", sessionId);
     } catch (e) {
-      emitTo(sessionId, "error", { message: "Failed to generate QR" });
+      emitTo(sessionId, "error", { message: "QR generation failed" });
+      log("ERROR", "QR generation failed", sessionId, { error: String(e) });
     }
   });
 
   client.on("authenticated", () => {
+    log("INFO", "Authenticated", sessionId);
     emitTo(sessionId, "status", { status: "AUTHENTICATED" });
   });
 
-  client.on("ready", async () => {
+  client.on("ready", () => {
     sessions[sessionId].ready = true;
     sessions[sessionId].qrDataUrl = null;
+    log("INFO", "Client ready", sessionId);
     emitTo(sessionId, "status", { status: "LOGGED_IN" });
   });
 
   client.on("auth_failure", (msg) => {
     sessions[sessionId].ready = false;
+    log("WARN", "Auth failure", sessionId, { msg });
     emitTo(sessionId, "status", { status: "AUTH_FAILURE", detail: msg });
   });
 
   client.on("disconnected", (reason) => {
+    log("WARN", "Client disconnected", sessionId, { reason });
     emitTo(sessionId, "status", { status: "DISCONNECTED", reason });
-    // Remove from memory so next call can re-init cleanly
     delete sessions[sessionId];
   });
 
-  // (Optional) If you wanted inbound msg events to UI, you could:
-  // client.on("message", (msg) => emitTo(sessionId, "incoming", { from: msg.from, body: msg.body }));
-
   client.initialize();
+  log("INFO", "Session initializing", sessionId);
 };
 
 // ===== Socket.IO =====
 io.on("connection", (socket) => {
-  // client emits this to join a session room for realtime events
   socket.on("join-session", (sessionId) => {
-    if (sessionId) {
-      socket.join(sessionId);
-      socket.emit("status", {
-        status:
-          sessions[sessionId]?.ready ? "LOGGED_IN" :
-          sessions[sessionId]?.qrDataUrl ? "WAITING_QR" :
-          sessions[sessionId] ? "STARTING" : "NOT_STARTED"
-      });
-      if (sessions[sessionId]?.qrDataUrl) {
-        socket.emit("qr", { qr: sessions[sessionId].qrDataUrl });
-      }
-    }
+    if (!sessionId) return;
+    socket.join(sessionId);
+    const sess = sessions[sessionId];
+    const status =
+      sess?.ready ? "LOGGED_IN" :
+      sess?.qrDataUrl ? "WAITING_QR" :
+      sess ? "STARTING" : "NOT_STARTED";
+    socket.emit("status", { status });
+    if (sess?.qrDataUrl) socket.emit("qr", { qr: sess.qrDataUrl });
   });
-
-  socket.on("disconnect", () => { /* no-op */ });
 });
 
 // ===== REST APIs =====
 
-// Start / Reuse a session
+// Health
+app.get("/admin/ping", (req, res) => {
+  res.json({ ok: true, ts: new Date().toISOString(), sessions: Object.keys(sessions) });
+});
+
+// Admin logs
+app.get("/admin/logs", (req, res) => {
+  const { sessionId, limit } = req.query;
+  let out = logs;
+  if (sessionId) out = out.filter(l => l.sessionId === sessionId);
+  const lim = Math.min(Number(limit) || 200, 1000);
+  res.json(out.slice(-lim).reverse());
+});
+
+// Start/Re-use session
 app.post("/start-session", (req, res) => {
   const { sessionId } = req.body;
   if (!sessionId) return res.status(400).json({ error: "sessionId required" });
@@ -142,103 +195,147 @@ app.post("/start-session", (req, res) => {
     createSession(sessionId);
     return res.json({ status: "STARTING" });
   }
-  return res.json({
-    status: sessions[sessionId].ready ? "LOGGED_IN" : "WAITING_QR"
-  });
+  const sess = sessions[sessionId];
+  return res.json({ status: sess.ready ? "LOGGED_IN" : (sess.qrDataUrl ? "WAITING_QR" : "STARTING") });
 });
 
-// Session status (includes QR if any)
+// Session status (quick QR fallback)
 app.get("/session-status/:sessionId", async (req, res) => {
   const { sessionId } = req.params;
   const sess = sessions[sessionId];
   if (!sess) return res.json({ status: "NOT_STARTED" });
 
   const state = await ensureConnected(sessionId);
-  if (state.ok) {
-    return res.json({ status: "LOGGED_IN" });
-  } else {
-    // If not connected but QR exists, tell UI to show it
-    return res.json({
-      status: sess.qrDataUrl ? "WAITING_QR" : "NOT_CONNECTED",
-      qr: sess.qrDataUrl || null
-    });
-  }
+  if (state.ok) return res.json({ status: "LOGGED_IN" });
+
+  return res.json({
+    status: sess.qrDataUrl ? "WAITING_QR" : "NOT_CONNECTED",
+    qr: sess.qrDataUrl || null
+  });
 });
 
-// Send text message
+// Send text
 app.post("/send-message", async (req, res) => {
   const { sessionId, number, message } = req.body;
   if (!sessionId || !number || !message) {
     return res.status(400).json({ error: "sessionId, number, message required" });
   }
-  if (!sessions[sessionId]) return res.status(404).json({ error: "Session not found" });
+  const sess = sessions[sessionId];
+  if (!sess) return res.status(404).json({ error: "Session not found" });
 
   const ok = await ensureConnected(sessionId);
   if (!ok.ok) return res.status(400).json({ error: "Session not connected" });
 
   try {
-    await sessions[sessionId].client.sendMessage(`${number}@c.us`, message);
+    await sess.client.sendMessage(`${number}@c.us`, message);
     emitTo(sessionId, "sent", { to: number, type: "text" });
-    return res.json({ status: "SENT" });
+    log("INFO", "Text sent", sessionId, { to: number });
+    res.json({ status: "SENT" });
   } catch (e) {
-    return res.status(500).json({ error: "Failed to send message" });
+    log("ERROR", "Send text failed", sessionId, { error: String(e) });
+    res.status(500).json({ error: "Failed to send message" });
   }
 });
 
-// Send media (PDF/Image/etc.)
+// Send media (PDF/Image/Video)
 app.post("/send-media", upload.single("file"), async (req, res) => {
-  const { sessionId, number } = req.body;
+  const { sessionId, number, caption } = req.body;
   const file = req.file;
+  if (!sessionId || !number || !file) {
+    return res.status(400).json({ error: "sessionId, number, file required" });
+  }
+  const sess = sessions[sessionId];
+  if (!sess) return res.status(404).json({ error: "Session not found" });
 
-  const session = sessions[sessionId];
-  if (!session) return res.status(400).json({ error: "Session not found" });
-  if (!session.ready) return res.status(400).json({ error: "Session not ready" });
-  if (!file) return res.status(400).json({ error: "No file uploaded" });
+  const ok = await ensureConnected(sessionId);
+  if (!ok.ok) {
+    try { fs.unlinkSync(file.path); } catch {}
+    return res.status(400).json({ error: "Session not connected" });
+  }
 
   try {
-    const filePath = path.join(__dirname, "uploads", file.filename);
-
-    // Read file in base64
-    const fileData = fs.readFileSync(filePath, { encoding: "base64" });
-
-    // Detect MIME type
+    const absPath = path.join(UPLOAD_DIR, file.filename);
+    const base64 = fs.readFileSync(absPath, { encoding: "base64" });
     const mimeType = mime.lookup(file.originalname) || "application/octet-stream";
+    const media = new MessageMedia(mimeType, base64, file.originalname);
 
-    // Create media object
-    const media = new MessageMedia(mimeType, fileData, file.originalname);
+    await sess.client.sendMessage(`${number}@c.us`, media, { caption });
+    emitTo(sessionId, "sent", { to: number, type: "media", filename: file.originalname });
+    log("INFO", "Media sent", sessionId, { to: number, filename: file.originalname });
 
-    // Send via WhatsApp
-    await session.client.sendMessage(`${number}@c.us`, media);
+    // persist to sent_files (optional)
+    const finalPath = path.join(SENT_DIR, file.originalname);
+    fs.renameSync(absPath, finalPath);
 
-    // OPTIONAL: Save permanently to "sent_files"
-    const sentFilesDir = path.join(__dirname, "sent_files");
-    if (!fs.existsSync(sentFilesDir)) fs.mkdirSync(sentFilesDir);
-    fs.renameSync(filePath, path.join(sentFilesDir, file.originalname));
-
-    res.json({ status: "Media sent successfully" });
-  } catch (err) {
-    console.error("Error sending media:", err);
+    res.json({ status: "SENT" });
+  } catch (e) {
+    log("ERROR", "Send media failed", sessionId, { error: String(e) });
+    try { fs.unlinkSync(req.file.path); } catch {}
     res.status(500).json({ error: "Failed to send media" });
   }
 });
 
-// Logout session
+// Logout
 app.post("/logout-session", async (req, res) => {
   const { sessionId } = req.body;
   if (!sessionId) return res.status(400).json({ error: "sessionId required" });
+
   const sess = sessions[sessionId];
   if (!sess) return res.status(404).json({ error: "Session not found" });
 
   try {
     await sess.client.logout();
-  } catch (_) {
-    // ignore
-  } finally {
-    delete sessions[sessionId];
-    emitTo(sessionId, "status", { status: "LOGGED_OUT" });
-    return res.json({ status: "LOGGED_OUT" });
+  } catch (_) {}
+  delete sessions[sessionId];
+  log("INFO", "Logged out", sessionId);
+  emitTo(sessionId, "status", { status: "LOGGED_OUT" });
+  res.json({ status: "LOGGED_OUT" });
+});
+
+// Delete cache only (auth folders)
+app.post("/admin/delete-cache", async (req, res) => {
+  const { sessionId } = req.body;
+  if (!sessionId) return res.status(400).json({ error: "sessionId required" });
+
+  const dirs = getAuthDirsForSession(sessionId);
+  let deleted = [];
+  for (const d of dirs) {
+    if (fs.existsSync(d)) {
+      fs.rmSync(d, { recursive: true, force: true });
+      deleted.push(d);
+    }
+  }
+  log("INFO", "Cache deleted", sessionId, { deleted });
+  res.json({ status: "CACHE_DELETED", deleted });
+});
+
+// Force reset (logout + delete cache)
+app.post("/admin/force-reset", async (req, res) => {
+  const { sessionId } = req.body;
+  if (!sessionId) return res.status(400).json({ error: "sessionId required" });
+
+  try {
+    if (sessions[sessionId]?.client) {
+      try { await sessions[sessionId].client.logout(); } catch (_) {}
+      delete sessions[sessionId];
+    }
+    const dirs = getAuthDirsForSession(sessionId);
+    let deleted = [];
+    for (const d of dirs) {
+      if (fs.existsSync(d)) {
+        fs.rmSync(d, { recursive: true, force: true });
+        deleted.push(d);
+      }
+    }
+    log("INFO", "Force reset complete", sessionId, { deleted });
+    res.json({ status: "FORCE_RESET_DONE", deleted });
+  } catch (e) {
+    log("ERROR", "Force reset failed", sessionId, { error: String(e) });
+    res.status(500).json({ error: "Force reset failed" });
   }
 });
 
 const PORT = process.env.PORT || 5000;
-server.listen(PORT, () => console.log(`Backend running on :${PORT}`));
+server.listen(PORT, () => {
+  log("INFO", `Backend running on :${PORT}`);
+});
